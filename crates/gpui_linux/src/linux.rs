@@ -1,9 +1,11 @@
 mod dispatcher;
+#[cfg(feature = "fbdev")]
+mod fbdev;
 mod headless;
 mod keyboard;
 mod platform;
 mod system_notifications;
-#[cfg(any(feature = "wayland", feature = "x11"))]
+#[cfg(any(feature = "wayland", feature = "x11", feature = "fbdev"))]
 mod text_system;
 #[cfg(feature = "wayland")]
 mod wayland;
@@ -14,10 +16,12 @@ mod x11;
 mod xdg_desktop_portal;
 
 pub use dispatcher::*;
+#[cfg(feature = "fbdev")]
+pub(crate) use fbdev::*;
 pub(crate) use headless::*;
 pub(crate) use keyboard::*;
 pub(crate) use platform::*;
-#[cfg(any(feature = "wayland", feature = "x11"))]
+#[cfg(any(feature = "wayland", feature = "x11", feature = "fbdev"))]
 pub(crate) use text_system::*;
 #[cfg(feature = "wayland")]
 pub(crate) use wayland::*;
@@ -28,12 +32,21 @@ use std::rc::Rc;
 
 /// Returns the default platform implementation for the current OS.
 pub fn current_platform(headless: bool) -> Rc<dyn gpui::Platform> {
-    #[cfg(feature = "x11")]
+    #[cfg(any(feature = "x11", feature = "fbdev"))]
     use anyhow::Context as _;
 
     if headless {
         return Rc::new(LinuxPlatform {
             inner: HeadlessClient::new(),
+        });
+    }
+
+    #[cfg(feature = "fbdev")]
+    if gpui::guess_compositor() == "Headless" && std::env::var_os("ZED_HEADLESS").is_none() {
+        return Rc::new(LinuxPlatform {
+            inner: FbdevClient::new()
+                .context("Failed to initialize the framebuffer client.")
+                .unwrap(),
         });
     }
 

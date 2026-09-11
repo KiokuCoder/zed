@@ -20,6 +20,7 @@ screen-capture = ["gpui/screen-capture", "gpui_macos/screen-capture", "gpui_wind
 runtime_shaders = ["gpui_macos/runtime_shaders"]
 wayland = ["gpui_linux/wayland"]
 x11 = ["gpui_linux/x11"]
+fbdev = ["gpui_linux/fbdev"]
 
 [dependencies]
 gpui.workspace = true

@@ -154,9 +154,9 @@ impl LinuxCommon {
         let (main_sender, main_receiver) = PriorityQueueCalloopReceiver::new();
         let (wake_sender, wake_receiver) = calloop::channel::channel();
 
-        #[cfg(any(feature = "wayland", feature = "x11"))]
+        #[cfg(any(feature = "wayland", feature = "x11", feature = "fbdev"))]
         let text_system = Arc::new(crate::linux::CosmicTextSystem::new("IBM Plex Sans"));
-        #[cfg(not(any(feature = "wayland", feature = "x11")))]
+        #[cfg(not(any(feature = "wayland", feature = "x11", feature = "fbdev")))]
         let text_system = Arc::new(gpui::NoopTextSystem::new());
 
         let callbacks = PlatformHandlers::default();

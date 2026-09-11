@@ -141,6 +141,60 @@ impl WgpuContext {
         })
     }
 
+    /// Creates a context on an OpenGL ES context the caller has already made current, for
+    /// targets wgpu cannot create a surface for itself (e.g. EGL on a Linux framebuffer).
+    ///
+    /// # Safety
+    /// The GL context must stay current on this thread whenever the returned context, or any
+    /// object created from it, is used or dropped.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub unsafe fn from_external_gl(
+        get_proc_address: impl FnMut(&str) -> *const std::ffi::c_void,
+    ) -> anyhow::Result<Self> {
+        let exposed_adapter = unsafe {
+            wgpu::hal::gles::Adapter::new_external(
+                get_proc_address,
+                wgpu::GlBackendOptions::default(),
+            )
+        }
+        .context("Failed to create a wgpu adapter from the current GL context")?;
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::GL,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = unsafe { instance.create_adapter_from_hal(exposed_adapter) };
+        let (device, queue, dual_source_blending, color_texture_format) =
+            gpui::block_on(Self::create_device(&adapter))?;
+
+        let device_lost = Arc::new(AtomicBool::new(false));
+        device.set_device_lost_callback({
+            let device_lost = Arc::clone(&device_lost);
+            move |reason, message| {
+                log::error!("wgpu device lost: reason={reason:?}, message={message}");
+                if reason != wgpu::DeviceLostReason::Destroyed {
+                    device_lost.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+
+        log::info!(
+            "Selected GPU adapter: {:?} (external GL context, vertex storage: {})",
+            adapter.get_info().name,
+            supports_vertex_storage(&adapter),
+        );
+
+        Ok(Self {
+            instance,
+            adapter,
+            device: Arc::new(device),
+            queue: Arc::new(queue),
+            backend: WgpuBackend::Native(wgpu::Backend::Gl),
+            dual_source_blending,
+            color_texture_format,
+            device_lost,
+        })
+    }
+
     #[cfg(target_family = "wasm")]
     pub async fn new_web(
         canvas: &web_sys::HtmlCanvasElement,
@@ -251,18 +305,15 @@ impl WgpuContext {
         }
 
         let color_atlas_texture_format = Self::select_color_texture_format(adapter)?;
-        #[cfg(target_family = "wasm")]
-        let required_limits = if adapter.get_info().backend == wgpu::Backend::Gl {
-            wgpu::Limits::downlevel_webgl2_defaults()
-                .using_resolution(adapter.limits())
-                .using_alignment(adapter.limits())
-        } else {
+        // Adapters without vertex-stage storage buffers (WebGL2, and GLES drivers such as ARM
+        // Mali's) take the texture-based instance data path, which only needs WebGL2 limits.
+        // Requesting the full downlevel limits there fails, e.g. on compute workgroup sizes.
+        let base_limits = if supports_vertex_storage(adapter) {
             wgpu::Limits::downlevel_defaults()
-                .using_resolution(adapter.limits())
-                .using_alignment(adapter.limits())
+        } else {
+            wgpu::Limits::downlevel_webgl2_defaults()
         };
-        #[cfg(not(target_family = "wasm"))]
-        let required_limits = wgpu::Limits::downlevel_defaults()
+        let required_limits = base_limits
             .using_resolution(adapter.limits())
             .using_alignment(adapter.limits());
 
@@ -542,7 +593,7 @@ impl WgpuContext {
     }
 
     pub fn uses_webgl_instance_data(&self) -> bool {
-        matches!(self.backend, WgpuBackend::Gl) && cfg!(target_family = "wasm")
+        !supports_vertex_storage(&self.adapter)
     }
 
     pub fn supports_dual_source_blending(&self) -> bool {
@@ -563,6 +614,13 @@ impl WgpuContext {
     pub(crate) fn device_lost_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.device_lost)
     }
+}
+
+fn supports_vertex_storage(adapter: &wgpu::Adapter) -> bool {
+    adapter
+        .get_downlevel_capabilities()
+        .flags
+        .contains(wgpu::DownlevelFlags::VERTEX_STORAGE)
 }
 
 #[cfg(not(target_family = "wasm"))]

@@ -176,11 +176,87 @@ enum InstanceData {
     },
 }
 
+/// Where frames are rendered: a window surface wgpu presents, or a texture the platform
+/// presents itself (e.g. by blitting into an EGL framebuffer wgpu cannot target).
+enum RenderTarget {
+    Surface(wgpu::Surface<'static>),
+    Offscreen(OffscreenTarget),
+}
+
+impl RenderTarget {
+    fn configure(&mut self, device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) {
+        match self {
+            Self::Surface(surface) => surface.configure(device, config),
+            Self::Offscreen(target) => *target = OffscreenTarget::new(device, config),
+        }
+    }
+}
+
+struct OffscreenTarget {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+impl OffscreenTarget {
+    fn new(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen_target"),
+            size: wgpu::Extent3d {
+                width: config.width,
+                height: config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: config.format,
+            usage: config.usage
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Self {
+            _texture: texture,
+            view,
+        }
+    }
+}
+
+struct TargetCapabilities {
+    formats: Vec<wgpu::TextureFormat>,
+    alpha_modes: Vec<wgpu::CompositeAlphaMode>,
+    present_modes: Vec<wgpu::PresentMode>,
+}
+
+impl TargetCapabilities {
+    fn offscreen() -> Self {
+        Self {
+            formats: vec![wgpu::TextureFormat::Rgba8Unorm],
+            alpha_modes: vec![
+                wgpu::CompositeAlphaMode::Opaque,
+                wgpu::CompositeAlphaMode::PreMultiplied,
+            ],
+            present_modes: vec![wgpu::PresentMode::Fifo],
+        }
+    }
+}
+
+impl From<wgpu::SurfaceCapabilities> for TargetCapabilities {
+    fn from(capabilities: wgpu::SurfaceCapabilities) -> Self {
+        Self {
+            formats: capabilities.formats,
+            alpha_modes: capabilities.alpha_modes,
+            present_modes: capabilities.present_modes,
+        }
+    }
+}
+
 /// GPU resources that must be dropped together during device recovery.
 struct WgpuResources {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
-    surface: wgpu::Surface<'static>,
+    target: RenderTarget,
     pipelines: WgpuPipelines,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
@@ -307,7 +383,7 @@ impl WgpuRenderer {
         Self::new_internal(
             Some(Rc::clone(&gpu_context)),
             context,
-            surface,
+            Some(surface),
             config,
             compositor_gpu,
             atlas,
@@ -335,18 +411,37 @@ impl WgpuRenderer {
         config: WgpuSurfaceConfig,
     ) -> anyhow::Result<Self> {
         let atlas = Arc::new(WgpuAtlas::from_context(context));
-        Self::new_internal(None, context, surface, config, None, atlas)
+        Self::new_internal(None, context, Some(surface), config, None, atlas)
+    }
+
+    /// Creates a renderer that draws into an offscreen texture instead of a window surface.
+    /// The platform presents each frame itself, reading it through [`Self::offscreen_view`].
+    pub fn new_offscreen(context: &WgpuContext, config: WgpuSurfaceConfig) -> anyhow::Result<Self> {
+        let atlas = Arc::new(WgpuAtlas::from_context(context));
+        Self::new_internal(None, context, None, config, None, atlas)
+    }
+
+    /// The texture the last frame was drawn into, for renderers created with
+    /// [`Self::new_offscreen`].
+    pub fn offscreen_view(&self) -> Option<&wgpu::TextureView> {
+        match &self.resources.as_ref()?.target {
+            RenderTarget::Offscreen(target) => Some(&target.view),
+            RenderTarget::Surface(_) => None,
+        }
     }
 
     fn new_internal(
         gpu_context: Option<GpuContext>,
         context: &WgpuContext,
-        surface: wgpu::Surface<'static>,
+        surface: Option<wgpu::Surface<'static>>,
         config: WgpuSurfaceConfig,
         compositor_gpu: Option<CompositorGpuHint>,
         atlas: Arc<WgpuAtlas>,
     ) -> anyhow::Result<Self> {
-        let surface_caps = surface.get_capabilities(&context.adapter);
+        let surface_caps = match &surface {
+            Some(surface) => TargetCapabilities::from(surface.get_capabilities(&context.adapter)),
+            None => TargetCapabilities::offscreen(),
+        };
         let preferred_formats = [
             wgpu::TextureFormat::Bgra8Unorm,
             wgpu::TextureFormat::Rgba8Unorm,
@@ -424,9 +519,15 @@ impl WgpuRenderer {
             alpha_mode,
             view_formats: vec![],
         };
-        // Configure the surface immediately. The adapter selection process already validated
-        // that this adapter can successfully configure this surface.
-        surface.configure(&context.device, &surface_config);
+        let target = match surface {
+            Some(surface) => {
+                // Configure the surface immediately. The adapter selection process already validated
+                // that this adapter can successfully configure this surface.
+                surface.configure(&context.device, &surface_config);
+                RenderTarget::Surface(surface)
+            }
+            None => RenderTarget::Offscreen(OffscreenTarget::new(&context.device, &surface_config)),
+        };
 
         let queue = Arc::clone(&context.queue);
         let rendering_params = RenderingParameters::new(&context.adapter, surface_format);
@@ -564,7 +665,7 @@ impl WgpuRenderer {
         let resources = WgpuResources {
             device,
             queue,
-            surface,
+            target,
             pipelines,
             bind_group_layouts,
             atlas_sampler,
@@ -1160,7 +1261,7 @@ impl WgpuRenderer {
             }
 
             resources
-                .surface
+                .target
                 .configure(&resources.device, &surface_config);
 
             // Invalidate intermediate textures - they will be lazily recreated
@@ -1219,7 +1320,7 @@ impl WgpuRenderer {
                 return;
             };
             resources
-                .surface
+                .target
                 .configure(&resources.device, &surface_config);
             resources.pipelines = Self::create_pipelines(
                 &resources.device,
@@ -1308,42 +1409,50 @@ impl WgpuRenderer {
 
         self.atlas.before_frame();
 
-        let frame = match self.resources().surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                // Textures must be destroyed before the surface can be reconfigured.
-                drop(frame);
-                let surface_config = self.surface_config.clone();
-                let resources = self.resources_mut();
-                resources
-                    .surface
-                    .configure(&resources.device, &surface_config);
-                return false;
+        let frame = if let RenderTarget::Surface(surface) = &self.resources().target {
+            match surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(frame) => Some(frame),
+                wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                    // Textures must be destroyed before the surface can be reconfigured.
+                    drop(frame);
+                    let surface_config = self.surface_config.clone();
+                    let resources = self.resources_mut();
+                    resources
+                        .target
+                        .configure(&resources.device, &surface_config);
+                    return false;
+                }
+                wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+                    let surface_config = self.surface_config.clone();
+                    let resources = self.resources_mut();
+                    resources
+                        .target
+                        .configure(&resources.device, &surface_config);
+                    return false;
+                }
+                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                    return false;
+                }
+                wgpu::CurrentSurfaceTexture::Validation => {
+                    *self.last_error.lock().unwrap() =
+                        Some("Surface texture validation error".to_string());
+                    return false;
+                }
             }
-            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                let surface_config = self.surface_config.clone();
-                let resources = self.resources_mut();
-                resources
-                    .surface
-                    .configure(&resources.device, &surface_config);
-                return false;
-            }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return false;
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                *self.last_error.lock().unwrap() =
-                    Some("Surface texture validation error".to_string());
-                return false;
-            }
+        } else {
+            None
         };
 
         // Now that we know the surface is healthy, ensure intermediate textures exist
         self.ensure_intermediate_textures();
 
-        let frame_view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let frame_view = match (&frame, &self.resources().target) {
+            (Some(frame), _) => frame
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default()),
+            (None, RenderTarget::Offscreen(target)) => target.view.clone(),
+            (None, RenderTarget::Surface(_)) => return false,
+        };
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
@@ -1398,7 +1507,9 @@ impl WgpuRenderer {
             return false;
         }
 
-        frame.present();
+        if let Some(frame) = frame {
+            frame.present();
+        }
         true
     }
 
@@ -2027,7 +2138,7 @@ impl WgpuRenderer {
                 .as_mut()
                 .expect("GPU resources not available");
             surface.configure(&res.device, &self.surface_config);
-            res.surface = surface;
+            res.target = RenderTarget::Surface(surface);
 
             // Invalidate intermediate textures — they'll be recreated lazily.
             res.invalidate_intermediate_textures();
@@ -2122,7 +2233,7 @@ impl WgpuRenderer {
         *self = Self::new_internal(
             Some(gpu_context.clone()),
             context,
-            surface,
+            Some(surface),
             config,
             self.compositor_gpu,
             self.atlas.clone(),
